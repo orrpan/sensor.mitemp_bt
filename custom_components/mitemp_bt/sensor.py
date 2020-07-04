@@ -6,6 +6,7 @@ import queue
 import statistics as sts
 import struct
 from threading import Thread
+import json
 
 import aioblescan as aiobs
 from Cryptodome.Cipher import AES
@@ -41,6 +42,8 @@ from .const import (
     DEFAULT_USE_MEDIAN,
     DEFAULT_ACTIVE_SCAN,
     DEFAULT_HCI_INTERFACE,
+    DEFAULT_MQTT,
+    DEFAULT_TOPIC,
     DEFAULT_BATT_ENTITIES,
     DEFAULT_REPORT_UNKNOWN,
     DEFAULT_WHITELIST,
@@ -51,6 +54,8 @@ from .const import (
     CONF_USE_MEDIAN,
     CONF_ACTIVE_SCAN,
     CONF_HCI_INTERFACE,
+    CONF_MQTT,
+    CONF_TOPIC,
     CONF_BATT_ENTITIES,
     CONF_ENCRYPTORS,
     CONF_REPORT_UNKNOWN,
@@ -88,6 +93,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(
             CONF_HCI_INTERFACE, default=[DEFAULT_HCI_INTERFACE]
         ): vol.All(cv.ensure_list, [cv.positive_int]),
+        vol.Optional(CONF_MQTT, default=DEFAULT_MQTT): cv.boolean,
+        vol.Optional(CONF_TOPIC, default=DEFAULT_TOPIC): cv.string,
         vol.Optional(CONF_BATT_ENTITIES, default=DEFAULT_BATT_ENTITIES): cv.boolean,
         vol.Optional(CONF_ENCRYPTORS, default={}): ENCRYPTORS_LIST_SCHEMA,
         vol.Optional(CONF_REPORT_UNKNOWN, default=DEFAULT_REPORT_UNKNOWN): cv.boolean,
@@ -170,7 +177,7 @@ class HCIdump(Thread):
             Thread.join(self, timeout)
             _LOGGER.debug("HCIdump thread: joined")
 
-    def filter_and_queue(self, data):
+    def filter_and_queue(data):
         """Filter hci events"""
         if data is None:
             return None
@@ -197,6 +204,45 @@ class HCIdump(Thread):
         if not (framectrl & 0x4000):
             return None
         self.dataqueue.put(data)
+
+
+class MQTTScanner:
+    """BLE scanner over MQTT."""
+
+    def __init__(self, config, mqtt):
+        self.hcidump_data = []
+        self.dataqueue = queue.Queue()
+        self.config = config
+        self.mqtt = mqtt
+
+    def message_received(self, msg):
+        """Handle new MQTT messages."""
+        _LOGGER.debug(msg.payload)
+
+        result = json.loads(msg.payload)
+        _LOGGER.debug(result)
+        try:
+            _LOGGER.debug(result["servicedata"])
+            msg_data = bytes.fromhex(result["servicedata"])
+            msg_data_len = len(msg_data)
+            msg_header = bytes.fromhex('0000')
+            msg_padding = bytes.fromhex('0000000000000000000000020106001695fe')
+            msg_padding_len = len(msg_padding)
+            msg_footer = bytes.fromhex('a8')  # rssi
+            msg_footer_len = len(msg_footer)
+            msg_len = \
+                bytearray([msg_data_len + msg_padding_len + msg_footer_len])
+
+            fullmsg = \
+                msg_header + msg_len + msg_padding + msg_data + msg_footer
+            self.dataqueue.put(fullmsg)
+        except KeyError as E:
+            pass
+
+    def start(self):
+        topic = self.config[CONF_TOPIC]
+        self.hcidump_data.clear()
+        self.mqtt.subscribe(topic, self.message_received)
 
 
 class BLEScanner:
@@ -583,8 +629,13 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         _LOGGER.info(
             "Attention! Option report_unknown is enabled, be ready for a huge output..."
         )
-    scanner = BLEScanner(config)
-    hass.bus.listen(EVENT_HOMEASSISTANT_STOP, scanner.shutdown_handler)
+    if not config[CONF_MQTT]:
+        scanner = BLEScanner(config)
+        hass.bus.listen(EVENT_HOMEASSISTANT_STOP, scanner.shutdown_handler)
+    else:
+        mqtt = hass.components.mqtt
+        scanner = MQTTScanner(config, mqtt)
+
     updater = Updater(scanner.dataqueue, config, add_entities)
     track_point_in_utc_time(
         hass,
